@@ -1,0 +1,188 @@
+# Higher Kotlin
+
+Some experiments with annotation processors, code generation, higher kinded types
+(sort of) and typeclasses (sort of) in Kotlin. Most of the stuff here isn't practical.
+
+## Higher-Kinded types
+
+See: https://en.wikipedia.org/wiki/Kind_(type_theory)
+
+Implemented as suggested by Yallop & White (2014) in their paper on higher-kinded
+polymorphism for languages that do not support it.
+
+### Usage
+
+Just annotate some class with `@Higher` and have the annotation processor on scope
+(see ["Using kapt"][kapt]):
+
+```kotlin
+@Higher
+data class Pair<A, B>(val left: A, val right: B) { companion object }
+```
+
+(P.S.: this requires a companion object on the target class)
+
+[kapt]: https://kotlinlang.org/docs/kapt.html
+
+#### Interface
+
+The annotation processor generates the following entities:
+- `{Class}Kind` (e.g. `PairKind`), an empty object whose sole purpose is serving
+  as a tag for higher-kind type expressions (more on those later)
+- Two projection/injection functions to transition between the "lower-kinded"
+  and "higher-kinded" worlds:
+  - `{Class}.Companion.inj` (e.g. `Pair.inj`). An injection function mapping an
+    object (e.g. `Pair<A, B>`) to its "higher-kinded" equivalent (e.g. `Ap2<PairKind, A, B>`).
+    This is only necessary because there's no way to modify the class to implement
+    the corresponding interface with an annotation processor, unfortunately.
+  - `{Class}.Companion.prj` (e.g. `Pair.prj`). The inverse function of `inj`.
+- Two helper functions for lifting/unlifting functions to/from the "higher-kinded" world:
+  - `{Class}.Companion.lift` takes `{Class}<A, B, ...> -> {Class}<C, D, ...>` to
+    `ApN<{Class}Kind, A, B, ...> -> Ap{N}<{Class}Kind, C, D, ...>`
+  - `{Class}.Companion.lift` is the inverse function of `lift`.
+
+#### Higher-Kind type expressions
+
+We define the following (purposefully empty) interface:
+
+```kotlin
+interface Ap<T, X>
+```
+
+A higher-kinded type expression is any valid parametrization of `Ap`.
+
+Kinds are curried, which means a kind of two arguments (`* -> * -> *`) is just a
+nested parametrization of `Ap`: `Ap<Ap<Kind, A>, B>`.
+We provide a shorthand in the form of `Ap{N}<Kind, A, B, ...> = Ap<Ap<Ap<...>, A>, B>`, up
+to 8 arguments (i.e. `Ap2`, `Ap3`, ... `Ap8`).
+
+##### Example with lists
+
+For instance, suppose the following type:
+```kotlin
+sealed class List<T> { companion object }
+class Nil<T> : List<T>()
+data class Cons<T>(val head: T, val tail: List<T>) : List<T>()
+```
+
+We could refer to the "higher kind" of List by creating a tag (i.e. an empty object) for it:
+```kotlin
+object ListKind // List<T> ~ Ap<ListKind, T>
+```
+
+Obviously, there's nothing linking `List` to `ListKind`. We do this by defining injection and
+projection functions from `List<T>` to `Ap<ListKind, T>` and vice-versa, respectively:
+
+```kotlin
+private data class ListWrapper<T>(val it: List<T>): Ap<ListKind, T>
+
+fun <T> inject(list: List<T>): Ap<ListKind, T> = ListWrapper(list)
+
+// Assume an unique implementation of Ap<ListKind, T>
+fun <T> project(it: Ap<ListKind, T>): List<T> = (it as ListWrapper<T>).it
+```
+
+Or simply:
+```kotlin
+object ListKind
+sealed class List<T>: Ap<ListKind, T> {
+  companion object {
+    fun <T> inject(list: List<T>): Ap<ListKind, T> = list
+    fun <T> project(it: Ap<ListKind, T>): List<T> = it as List<T>
+  }
+}
+class Nil<T> : List<T>()
+data class Cons<T>(val head: T, val tail: List<T>) : List<T>()
+```
+
+The first approach is essentially what the annotation processor does, since it can't
+change `List` to make it implement `Ap<ListKind, T>`.
+
+### References
+
+- Yallop, Jeremy, and Leo White. "Lightweight higher-kinded polymorphism."
+  International Symposium on Functional and Logic Programming. Springer, Cham, 2014.
+  Available at https://www.cl.cam.ac.uk/~jdy22/papers/lightweight-higher-kinded-polymorphism.pdf.
+
+## Typeclasses
+
+One interesting application for higher-kinded types is in typeclasses, like
+[those seen in Haskell][hs-typeclasses]. 
+
+Sadly, those too require some support from the language. We can work our way around
+this, though in a similar way to what is done in [Scala Cats][scala-cats]: a typeclass
+signature is replaced by an interface, and an instance is replaced by an object that
+implements the interface.
+
+We still cannot automatically derive instances from a set of constraints
+(e.g. `(Monoid a, Monoid b) => Monoid (a, b)`), but it's simple enough (although significantly
+more verbose) to simulate this with functions
+(e.g. `Pair<A, B>.monoid: (Monoid<A>, Monoid<B>) -> Monoid<Pair<A, B>>`).
+
+### Example with `Functor`
+
+See https://en.wikipedia.org/wiki/Functor_(functional_programming)
+
+It's pretty straightforward to define the interface for a Functor:
+
+```kotlin
+interface Functor<F> {
+    fun fmap(f: (A) -> B): (Ap<F, A>) -> Ap<F, B>
+}
+```
+
+Notice that we couldn't possibly have defined it without `Ap`, though, because `F<A>`
+would be syntactically invalid in Kotlin.
+
+Now let's use the `List` kind (this time with all the functions generated by the
+annotation processor, instead of done by hand) to define a functor for lists:
+
+```kotlin
+@Higher
+sealed class List<T> { companion object }
+class Nil<T> : List<T>()
+data class Cons<T>(val head: T, val tail: List<T>) : List<T>()
+
+fun List.Companion.functor() = object : Functor<ListKind> {
+  override fun <X, Y> fmap(f: (X) -> Y): (Ap<ListKind, X>) -> Ap<ListKind, Y> =
+    List.lift { list: List<X> ->
+      when (list) {
+        is Nil -> Nil()
+        is Cons -> Cons(f(list.head), List.unlift(fmap(f))(list.tail))
+      }
+    }
+}
+```
+
+Using the instance of functor then is not too hard:
+
+```kotlin
+fun main() {
+    val list = Cons(1, Cons(2, Cons(3, Nil())))
+    val double = { x: Int -> x * 2 }
+    val doubleList = List.unlift(List.functor().fmap(double))
+
+    println(doubleList(list)) // Cons(head=2, tail=Cons(head=4, tail=Cons(head=6, tail=io.github.higherkt.sample.Nil@4769b07b)))
+}
+```
+
+We could also simplify the declaration of `doubleList` by defining a shorthand
+for the application of `unlift` to an `fmap`'ed function, or even hide the functor
+altogether with an instance method (a.k.a. `map`):
+
+```kotlin
+fun <X, Y> List.Companion.fmap(f: (X) -> Y): (List<X>) -> List<Y> = List.unlift(List.functor().fmap(f))
+
+fun <X, Y> List<X>.map(f: (X) -> Y): List<Y> = List.fmap(f)(this)
+```
+
+This shows that the need to convert between `Ap` and `List` is indeed inconvenient,
+but can usually be worked around fairly easily.
+
+[hs-typeclasses]: https://www.haskell.org/tutorial/classes.html
+[scala-cats]: https://typelevel.org/cats/typeclasses.html
+
+
+## [WIP]
+
+TODO: Polynomial functors, cata/ana/hylo/paramorphisms.
